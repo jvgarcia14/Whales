@@ -5,11 +5,10 @@ from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -40,30 +39,18 @@ logger = logging.getLogger(__name__)
 # =========================================================
 # STATES
 # =========================================================
-(
-    WHALE_SELECT_MODEL,
-    WHALE_NAME,
-    WHALE_USER_ID,
-    WHALE_STATUS,
-    WHALE_LAST_CONVO,
-    WHALE_NOTES,
-    WHALE_COOLDOWN_REASON,
-    ADD_NOTE_WAITING,
-    QUICK_COOLDOWN_REASON,
-) = range(8 + 1)
+(WHALE_TEMPLATE_INPUT,) = range(1)
 
-STATUSES = [
-    "MAD",
-    "UPSET",
-    "WANT FREE SEXTING",
-    "WANNA LEAVE",
-    "NEED ATTENTION",
-    "ASKING FOR CUSTOM",
-    "HAPPY",
-    "COOLDOWN",
-]
-
-URGENT_STATUSES = {"MAD", "UPSET", "WANNA LEAVE"}
+VALID_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
+VALID_STATUSES = {
+    "CRITICAL",
+    "AT RISK",
+    "COOLING OFF",
+    "NEEDS ATTENTION",
+    "CUSTOM OPPORTUNITY",
+    "STABLE",
+}
+URGENT_STATUSES = {"CRITICAL", "AT RISK"}
 
 # =========================================================
 # DB
@@ -98,9 +85,11 @@ def init_db():
                     model_name TEXT NOT NULL,
                     whale_name TEXT NOT NULL,
                     whale_user_id TEXT NOT NULL,
+                    priority TEXT,
                     current_status TEXT NOT NULL,
                     last_convo TEXT,
                     notes TEXT,
+                    action_needed TEXT,
                     is_cooldown BOOLEAN NOT NULL DEFAULT FALSE,
                     cooldown_reason TEXT,
                     cooldown_started_at TIMESTAMP,
@@ -127,9 +116,11 @@ def init_db():
                     model_name TEXT NOT NULL,
                     whale_name TEXT NOT NULL,
                     whale_user_id TEXT NOT NULL,
+                    priority TEXT,
                     status TEXT NOT NULL,
                     last_convo TEXT,
                     notes TEXT,
+                    action_needed TEXT,
                     is_cooldown BOOLEAN NOT NULL DEFAULT FALSE,
                     cooldown_reason TEXT,
                     updated_by_id BIGINT,
@@ -170,28 +161,6 @@ def fmt_user(user) -> tuple[str, str]:
     return full_name, username
 
 
-def build_status_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("😡 MAD", callback_data=f"{prefix}:MAD"),
-            InlineKeyboardButton("😞 UPSET", callback_data=f"{prefix}:UPSET"),
-        ],
-        [
-            InlineKeyboardButton("🆓 FREE SEXTING", callback_data=f"{prefix}:WANT FREE SEXTING"),
-            InlineKeyboardButton("⚠️ WANNA LEAVE", callback_data=f"{prefix}:WANNA LEAVE"),
-        ],
-        [
-            InlineKeyboardButton("👀 NEED ATTENTION", callback_data=f"{prefix}:NEED ATTENTION"),
-            InlineKeyboardButton("💸 ASKING CUSTOM", callback_data=f"{prefix}:ASKING FOR CUSTOM"),
-        ],
-        [
-            InlineKeyboardButton("😊 HAPPY", callback_data=f"{prefix}:HAPPY"),
-            InlineKeyboardButton("❄️ COOLDOWN", callback_data=f"{prefix}:COOLDOWN"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
 def split_text(text: str, chunk_size: int = TG_SAFE) -> list[str]:
     if len(text) <= chunk_size:
         return [text]
@@ -209,29 +178,6 @@ def split_text(text: str, chunk_size: int = TG_SAFE) -> list[str]:
     if current:
         parts.append("".join(current))
     return parts
-
-
-def get_registered_models() -> list[str]:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT model_name FROM whale_topics ORDER BY lower(model_name) ASC")
-            return [r[0] for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-
-def build_model_keyboard(models: list[str]) -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for model in models:
-        row.append(InlineKeyboardButton(model.title(), callback_data=f"model:{model}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows)
 
 
 def get_topic_for_model(model_name: str):
@@ -271,12 +217,35 @@ def get_model_by_topic(chat_id: int, thread_id: int | None):
         conn.close()
 
 
-def get_whale_by_id(whale_id: int):
+def fetch_whales_for_model(model_name: str, only_urgent: bool = False, only_cooldown: bool = False):
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM whales WHERE id = %s", (whale_id,))
-            return cur.fetchone()
+            sql = """
+                SELECT *
+                FROM whales
+                WHERE lower(model_name) = lower(%s)
+            """
+            params = [model_name]
+
+            if only_urgent:
+                sql += " AND current_status = ANY(%s)"
+                params.append(list(URGENT_STATUSES))
+
+            if only_cooldown:
+                sql += " AND is_cooldown = TRUE"
+
+            sql += """
+                ORDER BY
+                    CASE
+                        WHEN current_status IN ('CRITICAL','AT RISK') THEN 1
+                        WHEN is_cooldown = TRUE THEN 2
+                        ELSE 3
+                    END,
+                    last_updated_at DESC
+            """
+            cur.execute(sql, tuple(params))
+            return cur.fetchall()
     finally:
         conn.close()
 
@@ -285,9 +254,11 @@ def upsert_whale_and_history(
     model_name: str,
     whale_name: str,
     whale_user_id: str,
+    priority: str,
     status: str,
     last_convo: str,
     notes: str,
+    action_needed: str,
     is_cooldown: bool,
     cooldown_reason: str | None,
     updated_by_id: int,
@@ -298,21 +269,24 @@ def upsert_whale_and_history(
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cooldown_started_at = now_pst() if is_cooldown else None
+
             cur.execute(
                 """
                 INSERT INTO whales (
-                    model_name, whale_name, whale_user_id, current_status,
-                    last_convo, notes, is_cooldown, cooldown_reason,
+                    model_name, whale_name, whale_user_id, priority, current_status,
+                    last_convo, notes, action_needed, is_cooldown, cooldown_reason,
                     cooldown_started_at, last_updated_at,
                     last_updated_by_id, last_updated_by_name, last_updated_by_username
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s)
                 ON CONFLICT (model_name, whale_user_id)
                 DO UPDATE SET
                     whale_name = EXCLUDED.whale_name,
+                    priority = EXCLUDED.priority,
                     current_status = EXCLUDED.current_status,
                     last_convo = EXCLUDED.last_convo,
                     notes = EXCLUDED.notes,
+                    action_needed = EXCLUDED.action_needed,
                     is_cooldown = EXCLUDED.is_cooldown,
                     cooldown_reason = EXCLUDED.cooldown_reason,
                     cooldown_started_at = EXCLUDED.cooldown_started_at,
@@ -326,9 +300,11 @@ def upsert_whale_and_history(
                     model_name,
                     whale_name,
                     whale_user_id,
+                    priority,
                     status,
                     last_convo,
                     notes,
+                    action_needed,
                     is_cooldown,
                     cooldown_reason,
                     cooldown_started_at,
@@ -338,23 +314,26 @@ def upsert_whale_and_history(
                 ),
             )
             whale_row = cur.fetchone()
+
             cur.execute(
                 """
                 INSERT INTO whale_updates (
-                    whale_id, model_name, whale_name, whale_user_id, status,
-                    last_convo, notes, is_cooldown, cooldown_reason,
+                    whale_id, model_name, whale_name, whale_user_id, priority, status,
+                    last_convo, notes, action_needed, is_cooldown, cooldown_reason,
                     updated_by_id, updated_by_name, updated_by_username
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     whale_row["id"],
                     model_name,
                     whale_name,
                     whale_user_id,
+                    priority,
                     status,
                     last_convo,
                     notes,
+                    action_needed,
                     is_cooldown,
                     cooldown_reason,
                     updated_by_id,
@@ -365,171 +344,21 @@ def upsert_whale_and_history(
             return whale_row
     finally:
         conn.close()
-
-
-def quick_update_whale(
-    whale_id: int,
-    status: str,
-    updated_by_id: int,
-    updated_by_name: str,
-    updated_by_username: str,
-    note_append: str | None = None,
-    cooldown_reason: str | None = None,
-    clear_cooldown: bool = False,
-):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM whales WHERE id = %s", (whale_id,))
-            existing = cur.fetchone()
-            if not existing:
-                return None
-
-            notes = existing["notes"] or ""
-            if note_append:
-                if notes.strip():
-                    notes = f"{notes}\n• {note_append}"
-                else:
-                    notes = note_append
-
-            is_cooldown = status == "COOLDOWN"
-            if clear_cooldown:
-                is_cooldown = False
-                cooldown_reason = None
-                status = "HAPPY" if existing["current_status"] == "COOLDOWN" else existing["current_status"]
-
-            cooldown_started_at = now_pst() if is_cooldown else None
-
-            cur.execute(
-                """
-                UPDATE whales
-                SET current_status = %s,
-                    notes = %s,
-                    is_cooldown = %s,
-                    cooldown_reason = %s,
-                    cooldown_started_at = %s,
-                    last_updated_at = NOW(),
-                    last_updated_by_id = %s,
-                    last_updated_by_name = %s,
-                    last_updated_by_username = %s
-                WHERE id = %s
-                RETURNING *
-                """,
-                (
-                    status,
-                    notes,
-                    is_cooldown,
-                    cooldown_reason,
-                    cooldown_started_at,
-                    updated_by_id,
-                    updated_by_name,
-                    updated_by_username,
-                    whale_id,
-                ),
-            )
-            whale_row = cur.fetchone()
-
-            cur.execute(
-                """
-                INSERT INTO whale_updates (
-                    whale_id, model_name, whale_name, whale_user_id, status,
-                    last_convo, notes, is_cooldown, cooldown_reason,
-                    updated_by_id, updated_by_name, updated_by_username
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    whale_row["id"],
-                    whale_row["model_name"],
-                    whale_row["whale_name"],
-                    whale_row["whale_user_id"],
-                    whale_row["current_status"],
-                    whale_row["last_convo"],
-                    whale_row["notes"],
-                    whale_row["is_cooldown"],
-                    whale_row["cooldown_reason"],
-                    updated_by_id,
-                    updated_by_name,
-                    updated_by_username,
-                ),
-            )
-            return whale_row
-    finally:
-        conn.close()
-
-
-def fetch_whales_for_model(model_name: str, only_urgent: bool = False, only_cooldown: bool = False):
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            base_sql = """
-                SELECT *
-                FROM whales
-                WHERE lower(model_name) = lower(%s)
-            """
-            params = [model_name]
-            if only_urgent:
-                base_sql += " AND current_status = ANY(%s)"
-                params.append(list(URGENT_STATUSES))
-            if only_cooldown:
-                base_sql += " AND is_cooldown = TRUE"
-
-            base_sql += """
-                ORDER BY
-                    CASE
-                        WHEN current_status IN ('MAD','UPSET','WANNA LEAVE') THEN 1
-                        WHEN is_cooldown = TRUE THEN 2
-                        ELSE 3
-                    END,
-                    last_updated_at DESC
-            """
-            cur.execute(base_sql, tuple(params))
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def build_quick_update_keyboard(whale_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("😡 Mad", callback_data=f"quickstatus:{whale_id}:MAD"),
-                InlineKeyboardButton("😞 Upset", callback_data=f"quickstatus:{whale_id}:UPSET"),
-            ],
-            [
-                InlineKeyboardButton("😊 Happy", callback_data=f"quickstatus:{whale_id}:HAPPY"),
-                InlineKeyboardButton("👀 Need Attention", callback_data=f"quickstatus:{whale_id}:NEED ATTENTION"),
-            ],
-            [
-                InlineKeyboardButton("💸 Asking Custom", callback_data=f"quickstatus:{whale_id}:ASKING FOR CUSTOM"),
-                InlineKeyboardButton("⚠️ Wanna Leave", callback_data=f"quickstatus:{whale_id}:WANNA LEAVE"),
-            ],
-            [
-                InlineKeyboardButton("❄️ Cooldown", callback_data=f"quickcooldown:{whale_id}"),
-                InlineKeyboardButton("✅ Clear Cooldown", callback_data=f"clearcooldown:{whale_id}"),
-            ],
-            [
-                InlineKeyboardButton("📝 Add Note", callback_data=f"addnote:{whale_id}"),
-            ],
-        ]
-    )
 
 
 def format_whale_update_message(whale_row, title: str = "🐳 WHALE UPDATE") -> str:
-    cooldown_line = ""
-    if whale_row.get("is_cooldown"):
-        cooldown_line = f"\n⏳ Cooldown Reason: {whale_row.get('cooldown_reason') or '-'}"
-
     return (
         f"{title}\n\n"
         f"👤 Model: {str(whale_row['model_name']).upper()}\n"
         f"💎 Whale: {whale_row['whale_name']}\n"
-        f"🆔 User ID: {whale_row['whale_user_id']}\n\n"
-        f"📌 Status: {whale_row['current_status']}{' ❄️' if whale_row.get('is_cooldown') else ''}\n"
-        f"💬 Last Convo: {whale_row.get('last_convo') or '-'}\n"
-        f"📝 Notes: {whale_row.get('notes') or '-'}"
-        f"{cooldown_line}\n\n"
-        f"👨 Updated by: {whale_row.get('last_updated_by_name') or '-'} ({whale_row.get('last_updated_by_username') or '-'})\n"
+        f"🆔 User ID: {whale_row['whale_user_id']}\n"
+        f"🚦 Priority: {whale_row.get('priority') or '-'}\n"
+        f"📌 Status: {whale_row['current_status']}\n\n"
+        f"💬 Last Convo:\n{whale_row.get('last_convo') or '-'}\n\n"
+        f"📝 Notes:\n{whale_row.get('notes') or '-'}\n\n"
+        f"🎯 Action:\n{whale_row.get('action_needed') or '-'}\n\n"
+        f"⏳ Cooldown Reason:\n{whale_row.get('cooldown_reason') or '-'}\n\n"
+        f"👤 Updated by:\n{whale_row.get('last_updated_by_name') or '-'} ({whale_row.get('last_updated_by_username') or '-'})\n\n"
         f"🕒 {fmt_dt_pst(whale_row.get('last_updated_at'))}"
     )
 
@@ -544,15 +373,84 @@ async def send_to_registered_topic(bot, whale_row, extra_alert: bool = True):
         chat_id=topic["managers_chat_id"],
         message_thread_id=topic["message_thread_id"],
         text=format_whale_update_message(whale_row),
-        reply_markup=build_quick_update_keyboard(whale_row["id"]),
     )
 
     if extra_alert and whale_row["current_status"] in URGENT_STATUSES:
+        alert_text = (
+            "🚨 WHALE ALERT\n\n"
+            f"Model: {str(whale_row['model_name']).upper()}\n"
+            f"Whale: {whale_row['whale_name']}\n"
+            f"Status: {whale_row['current_status']}\n"
+            f"Priority: {whale_row.get('priority') or '-'}\n"
+            f"Updated by: {whale_row.get('last_updated_by_username') or '-'}"
+        )
         await bot.send_message(
             chat_id=topic["managers_chat_id"],
             message_thread_id=topic["message_thread_id"],
-            text=format_whale_update_message(whale_row, title="🚨 URGENT WHALE ALERT"),
+            text=alert_text,
         )
+
+
+def parse_template_message(text: str) -> dict[str, str]:
+    result = {}
+    lines = text.splitlines()
+
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key == "model":
+            result["model_name"] = value.lower()
+        elif key == "whale":
+            result["whale_name"] = value
+        elif key == "user id":
+            result["whale_user_id"] = value
+        elif key == "priority":
+            result["priority"] = value.upper()
+        elif key == "status":
+            result["current_status"] = value.upper()
+        elif key == "last convo":
+            result["last_convo"] = value
+        elif key == "notes":
+            result["notes"] = value
+        elif key == "action":
+            result["action_needed"] = value
+        elif key == "cooldown reason":
+            result["cooldown_reason"] = value
+
+    return result
+
+
+def validate_template_data(data: dict[str, str]) -> str | None:
+    required = [
+        "model_name",
+        "whale_name",
+        "whale_user_id",
+        "priority",
+        "current_status",
+        "last_convo",
+        "notes",
+        "action_needed",
+        "cooldown_reason",
+    ]
+
+    missing = [field for field in required if not data.get(field)]
+    if missing:
+        return f"Missing fields: {', '.join(missing)}"
+
+    if data["priority"] not in VALID_PRIORITIES:
+        return "Priority must be one of: High, Medium, Low"
+
+    if data["current_status"] not in VALID_STATUSES:
+        return (
+            "Status must be one of: Critical, At Risk, Cooling Off, "
+            "Needs Attention, Custom Opportunity, Stable"
+        )
+
+    return None
 
 
 # =========================================================
@@ -564,7 +462,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Managers topic setup:\n"
         "/register carter  -> run inside the model topic\n\n"
         "Chatters:\n"
-        "/whale -> create whale update\n\n"
+        "/whale -> send one full whale update template\n\n"
         "Managers inside topic:\n"
         "/whales\n"
         "/handover\n"
@@ -612,6 +510,7 @@ async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """,
                 (model_name, chat.id, thread_id),
             )
+
         await update.message.reply_text(
             f"✅ Registered model '{model_name}' to this topic.\n"
             f"Future /whale updates for {model_name.title()} will go here."
@@ -621,41 +520,81 @@ async def register_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def whale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    models = get_registered_models()
-    if not models:
-        await update.message.reply_text("No models registered yet. Use /register inside manager topics first.")
-        return ConversationHandler.END
-
-    context.user_data["whale_form"] = {}
-    preview = ", ".join(m.title() for m in models[:20])
-    extra = " ..." if len(models) > 20 else ""
-    await update.message.reply_text(
-        "Type the model name exactly as registered.\n\n"
-        f"Registered models: {preview}{extra}\n\n"
-        "Example: carter"
+    template = (
+        "Send whale update in this format:\n\n"
+        "Model: carter\n"
+        "Whale: John\n"
+        "User ID: @9812377\n"
+        "Priority: High\n"
+        "Status: At Risk\n"
+        "Last Convo: he's mad about the custom\n"
+        "Notes: gif first\n"
+        "Action: soft handle, no hard upsell\n"
+        "Cooldown Reason: -\n\n"
+        "Priority options:\n"
+        "High\n"
+        "Medium\n"
+        "Low\n\n"
+        "Status options:\n"
+        "Critical\n"
+        "At Risk\n"
+        "Cooling Off\n"
+        "Needs Attention\n"
+        "Custom Opportunity\n"
+        "Stable"
     )
-    return WHALE_SELECT_MODEL
+    await update.message.reply_text(template)
+    return WHALE_TEMPLATE_INPUT
 
 
-async def whale_model_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    typed_model = update.message.text.strip().lower()
-    models = {m.lower(): m for m in get_registered_models()}
+async def whale_template_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = parse_template_message(update.message.text.strip())
+    error = validate_template_data(data)
 
-    if typed_model not in models:
-        preview = ", ".join(sorted(models.keys())[:20])
-        extra = " ..." if len(models) > 20 else ""
+    if error:
         await update.message.reply_text(
-            "Model not found. Type the model name exactly as registered.\n\n"
-            f"Available models: {preview}{extra}"
+            f"❌ {error}\n\n"
+            "Please send again using this exact format:\n\n"
+            "Model: carter\n"
+            "Whale: John\n"
+            "User ID: @9812377\n"
+            "Priority: High\n"
+            "Status: At Risk\n"
+            "Last Convo: he's mad about the custom\n"
+            "Notes: gif first\n"
+            "Action: soft handle, no hard upsell\n"
+            "Cooldown Reason: -"
         )
-        return WHALE_SELECT_MODEL
+        return WHALE_TEMPLATE_INPUT
 
-    context.user_data.setdefault("whale_form", {})["model_name"] = typed_model
-    await update.message.reply_text(
-        f"Selected model: {typed_model.title()}\n\n"
-        "Send whale name:"
+    full_name, username = fmt_user(update.effective_user)
+    is_cooldown = data["current_status"] == "COOLING OFF"
+
+    cooldown_reason = data["cooldown_reason"]
+    if cooldown_reason == "-":
+        cooldown_reason = None
+
+    whale_row = upsert_whale_and_history(
+        model_name=data["model_name"],
+        whale_name=data["whale_name"],
+        whale_user_id=data["whale_user_id"],
+        priority=data["priority"].title(),
+        status=data["current_status"].title(),
+        last_convo=data["last_convo"],
+        notes=data["notes"],
+        action_needed=data["action_needed"],
+        is_cooldown=is_cooldown,
+        cooldown_reason=cooldown_reason,
+        updated_by_id=update.effective_user.id,
+        updated_by_name=full_name,
+        updated_by_username=username,
     )
-    return WHALE_NAME
+
+    await send_to_registered_topic(context.bot, whale_row, extra_alert=True)
+    await update.message.reply_text(
+        f"✅ Whale update sent to {data['model_name'].title()} topic."
+    )
+    return ConversationHandler.END
 
 
 async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,32 +611,22 @@ async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No whales found for {model_name.title()}.")
         return
 
-    text = [f"🐳 ACTIVE WHALES — {model_name.upper()}\n"]
+    parts = [f"🐳 ACTIVE WHALES — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        if r["is_cooldown"]:
-            entry = (
-                f"{i}. {r['whale_name']}\n"
-                f"🆔 {r['whale_user_id']}\n"
-                f"📌 {r['current_status']} ❄️\n"
-                f"💬 {r.get('last_convo') or '-'}\n"
-                f"📝 {r.get('notes') or '-'}\n"
-                f"⏳ {r.get('cooldown_reason') or '-'}\n"
-            )
-        else:
-            entry = (
-                f"{i}. {r['whale_name']}\n"
-                f"🆔 {r['whale_user_id']}\n"
-                f"📌 {r['current_status']}\n"
-                f"💬 {r.get('last_convo') or '-'}\n"
-                f"📝 {r.get('notes') or '-'}\n"
-            )
-        entry += (
+        parts.append(
+            f"{i}. {r['whale_name']}\n"
+            f"🆔 {r['whale_user_id']}\n"
+            f"🚦 {r.get('priority') or '-'}\n"
+            f"📌 {r['current_status']}\n"
+            f"💬 {r.get('last_convo') or '-'}\n"
+            f"📝 {r.get('notes') or '-'}\n"
+            f"🎯 {r.get('action_needed') or '-'}\n"
+            f"⏳ {r.get('cooldown_reason') or '-'}\n"
             f"👨 {r.get('last_updated_by_username') or '-'}\n"
             f"🕒 {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
-        text.append(entry)
 
-    final_text = "\n".join(text)
+    final_text = "\n".join(parts)
     for chunk in split_text(final_text):
         await update.message.reply_text(chunk)
 
@@ -716,30 +645,21 @@ async def handover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No whales found for {model_name.title()}.")
         return
 
-    lines = [f"📋 WHALE HANDOVER — {model_name.upper()}\n"]
+    parts = [f"📋 WHALE HANDOVER — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        if r["is_cooldown"]:
-            entry = (
-                f"{i}. {r['whale_name']} — {r['current_status']} ❄️\n"
-                f"- user id: {r['whale_user_id']}\n"
-                f"- last convo: {r.get('last_convo') or '-'}\n"
-                f"- notes: {r.get('notes') or '-'}\n"
-                f"- cooldown: {r.get('cooldown_reason') or '-'}\n"
-            )
-        else:
-            entry = (
-                f"{i}. {r['whale_name']} — {r['current_status']}\n"
-                f"- user id: {r['whale_user_id']}\n"
-                f"- last convo: {r.get('last_convo') or '-'}\n"
-                f"- notes: {r.get('notes') or '-'}\n"
-            )
-        entry += (
+        parts.append(
+            f"{i}. {r['whale_name']} — {r['current_status']}\n"
+            f"- user id: {r['whale_user_id']}\n"
+            f"- priority: {r.get('priority') or '-'}\n"
+            f"- last convo: {r.get('last_convo') or '-'}\n"
+            f"- notes: {r.get('notes') or '-'}\n"
+            f"- action: {r.get('action_needed') or '-'}\n"
+            f"- cooldown: {r.get('cooldown_reason') or '-'}\n"
             f"- updated by: {r.get('last_updated_by_username') or '-'}\n"
             f"- updated at: {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
-        lines.append(entry)
 
-    final_text = "\n".join(lines)
+    final_text = "\n".join(parts)
     for chunk in split_text(final_text):
         await update.message.reply_text(chunk)
 
@@ -758,18 +678,21 @@ async def urgent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No urgent whales for {model_name.title()}.")
         return
 
-    lines = [f"🚨 URGENT WHALES — {model_name.upper()}\n"]
+    parts = [f"🚨 URGENT WHALES — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        lines.append(
+        parts.append(
             f"{i}. {r['whale_name']}\n"
             f"🆔 {r['whale_user_id']}\n"
+            f"🚦 {r.get('priority') or '-'}\n"
             f"📌 {r['current_status']}\n"
             f"💬 {r.get('last_convo') or '-'}\n"
             f"📝 {r.get('notes') or '-'}\n"
+            f"🎯 {r.get('action_needed') or '-'}\n"
             f"👨 {r.get('last_updated_by_username') or '-'}\n"
             f"🕒 {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
-    final_text = "\n".join(lines)
+
+    final_text = "\n".join(parts)
     for chunk in split_text(final_text):
         await update.message.reply_text(chunk)
 
@@ -788,251 +711,27 @@ async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No cooldown whales for {model_name.title()}.")
         return
 
-    lines = [f"❄️ COOLDOWN WHALES — {model_name.upper()}\n"]
+    parts = [f"❄️ COOLDOWN WHALES — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        lines.append(
+        parts.append(
             f"{i}. {r['whale_name']}\n"
             f"🆔 {r['whale_user_id']}\n"
+            f"🚦 {r.get('priority') or '-'}\n"
             f"⏳ {r.get('cooldown_reason') or '-'}\n"
             f"📝 {r.get('notes') or '-'}\n"
+            f"🎯 {r.get('action_needed') or '-'}\n"
             f"👨 {r.get('last_updated_by_username') or '-'}\n"
             f"🕒 {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
-    final_text = "\n".join(lines)
+
+    final_text = "\n".join(parts)
     for chunk in split_text(final_text):
         await update.message.reply_text(chunk)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("whale_form", None)
-    context.user_data.pop("add_note_whale_id", None)
-    context.user_data.pop("quick_cooldown_whale_id", None)
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
-
-
-# =========================================================
-# /WHALE FLOW
-# =========================================================
-async def whale_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("whale_form", {})["whale_name"] = update.message.text.strip()
-    await update.message.reply_text("Send whale user ID:")
-    return WHALE_USER_ID
-
-
-async def whale_user_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("whale_form", {})["whale_user_id"] = update.message.text.strip()
-    await update.message.reply_text("Select status:", reply_markup=build_status_keyboard("newstatus"))
-    return WHALE_STATUS
-
-
-async def whale_status_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data or ""
-    if not data.startswith("newstatus:"):
-        return WHALE_STATUS
-
-    status = data.split(":", 1)[1]
-    context.user_data.setdefault("whale_form", {})["current_status"] = status
-    await query.message.reply_text(f"Status selected: {status}\n\nSend last convo:")
-    return WHALE_LAST_CONVO
-
-
-async def whale_last_convo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("whale_form", {})["last_convo"] = update.message.text.strip()
-    await update.message.reply_text("Send notes:\nExample: gfe him, do not upsell")
-    return WHALE_NOTES
-
-
-async def whale_notes_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    form = context.user_data.setdefault("whale_form", {})
-    form["notes"] = update.message.text.strip()
-
-    if form.get("current_status") == "COOLDOWN":
-        await update.message.reply_text(
-            "Send cooldown reason:\nExample: just milked him / said no more money"
-        )
-        return WHALE_COOLDOWN_REASON
-
-    return await finalize_whale_submission(update, context, cooldown_reason=None)
-
-
-async def whale_cooldown_reason_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cooldown_reason = update.message.text.strip()
-    return await finalize_whale_submission(update, context, cooldown_reason=cooldown_reason)
-
-
-async def finalize_whale_submission(update: Update, context: ContextTypes.DEFAULT_TYPE, cooldown_reason: str | None):
-    form = context.user_data.get("whale_form", {})
-    if not form:
-        await update.message.reply_text("Form expired. Start again with /whale")
-        return ConversationHandler.END
-
-    full_name, username = fmt_user(update.effective_user)
-    status = form["current_status"]
-    whale_row = upsert_whale_and_history(
-        model_name=form["model_name"],
-        whale_name=form["whale_name"],
-        whale_user_id=form["whale_user_id"],
-        status=status,
-        last_convo=form.get("last_convo", ""),
-        notes=form.get("notes", ""),
-        is_cooldown=(status == "COOLDOWN"),
-        cooldown_reason=cooldown_reason,
-        updated_by_id=update.effective_user.id,
-        updated_by_name=full_name,
-        updated_by_username=username,
-    )
-
-    await send_to_registered_topic(context.bot, whale_row, extra_alert=True)
-    await update.message.reply_text(
-        f"✅ Whale update sent to {form['model_name'].title()} topic."
-    )
-    context.user_data.pop("whale_form", None)
-    return ConversationHandler.END
-
-
-# =========================================================
-# QUICK BUTTONS
-# =========================================================
-async def quick_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        _, whale_id_str, status = query.data.split(":", 2)
-        whale_id = int(whale_id_str)
-    except Exception:
-        await query.message.reply_text("Invalid quick update data.")
-        return
-
-    full_name, username = fmt_user(query.from_user)
-    whale_row = quick_update_whale(
-        whale_id=whale_id,
-        status=status,
-        updated_by_id=query.from_user.id,
-        updated_by_name=full_name,
-        updated_by_username=username,
-    )
-    if not whale_row:
-        await query.message.reply_text("Whale not found.")
-        return
-
-    await send_to_registered_topic(context.bot, whale_row, extra_alert=True)
-    await query.message.reply_text(f"✅ Updated {whale_row['whale_name']} to {status}.")
-
-
-async def add_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        whale_id = int(query.data.split(":", 1)[1])
-    except Exception:
-        await query.message.reply_text("Invalid note data.")
-        return ConversationHandler.END
-
-    context.user_data["add_note_whale_id"] = whale_id
-    await query.message.reply_text("Send the note you want to add:")
-    return ADD_NOTE_WAITING
-
-
-async def add_note_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    whale_id = context.user_data.get("add_note_whale_id")
-    if not whale_id:
-        await update.message.reply_text("No whale selected for note. Use the button again.")
-        return ConversationHandler.END
-
-    note = update.message.text.strip()
-    full_name, username = fmt_user(update.effective_user)
-    existing = get_whale_by_id(whale_id)
-    if not existing:
-        await update.message.reply_text("Whale not found.")
-        return ConversationHandler.END
-
-    whale_row = quick_update_whale(
-        whale_id=whale_id,
-        status=existing["current_status"],
-        updated_by_id=update.effective_user.id,
-        updated_by_name=full_name,
-        updated_by_username=username,
-        note_append=note,
-        cooldown_reason=existing.get("cooldown_reason"),
-    )
-    await send_to_registered_topic(context.bot, whale_row, extra_alert=False)
-    await update.message.reply_text("✅ Note added.")
-    context.user_data.pop("add_note_whale_id", None)
-    return ConversationHandler.END
-
-
-async def quick_cooldown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        whale_id = int(query.data.split(":", 1)[1])
-    except Exception:
-        await query.message.reply_text("Invalid cooldown data.")
-        return ConversationHandler.END
-
-    context.user_data["quick_cooldown_whale_id"] = whale_id
-    await query.message.reply_text(
-        "Send cooldown reason:\nExample: just milked him / said no more money"
-    )
-    return QUICK_COOLDOWN_REASON
-
-
-async def quick_cooldown_reason_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    whale_id = context.user_data.get("quick_cooldown_whale_id")
-    if not whale_id:
-        await update.message.reply_text("No whale selected for cooldown. Use the button again.")
-        return ConversationHandler.END
-
-    reason = update.message.text.strip()
-    full_name, username = fmt_user(update.effective_user)
-    whale_row = quick_update_whale(
-        whale_id=whale_id,
-        status="COOLDOWN",
-        updated_by_id=update.effective_user.id,
-        updated_by_name=full_name,
-        updated_by_username=username,
-        cooldown_reason=reason,
-    )
-    if not whale_row:
-        await update.message.reply_text("Whale not found.")
-        return ConversationHandler.END
-
-    await send_to_registered_topic(context.bot, whale_row, extra_alert=False)
-    await update.message.reply_text("✅ Cooldown added.")
-    context.user_data.pop("quick_cooldown_whale_id", None)
-    return ConversationHandler.END
-
-
-async def clear_cooldown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    try:
-        whale_id = int(query.data.split(":", 1)[1])
-    except Exception:
-        await query.message.reply_text("Invalid clear cooldown data.")
-        return
-
-    full_name, username = fmt_user(query.from_user)
-    existing = get_whale_by_id(whale_id)
-    if not existing:
-        await query.message.reply_text("Whale not found.")
-        return
-
-    whale_row = quick_update_whale(
-        whale_id=whale_id,
-        status=existing["current_status"],
-        updated_by_id=query.from_user.id,
-        updated_by_name=full_name,
-        updated_by_username=username,
-        clear_cooldown=True,
-    )
-    await send_to_registered_topic(context.bot, whale_row, extra_alert=False)
-    await query.message.reply_text(f"✅ Cleared cooldown for {whale_row['whale_name']}.")
 
 
 # =========================================================
@@ -1047,36 +746,14 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     whale_conv = ConversationHandler(
         entry_points=[CommandHandler("whale", whale_start)],
         states={
-            WHALE_SELECT_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_model_typed)],
-            WHALE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_name_received)],
-            WHALE_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_user_id_received)],
-            WHALE_STATUS: [CallbackQueryHandler(whale_status_selected, pattern=r"^newstatus:")],
-            WHALE_LAST_CONVO: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_last_convo_received)],
-            WHALE_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_notes_received)],
-            WHALE_COOLDOWN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, whale_cooldown_reason_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-        allow_reentry=True,
-    )
-
-    add_note_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_note_callback, pattern=r"^addnote:")],
-        states={
-            ADD_NOTE_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_note_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-        allow_reentry=True,
-    )
-
-    quick_cooldown_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(quick_cooldown_callback, pattern=r"^quickcooldown:")],
-        states={
-            QUICK_COOLDOWN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, quick_cooldown_reason_received)],
+            WHALE_TEMPLATE_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, whale_template_received)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
         allow_reentry=True,
@@ -1089,15 +766,10 @@ def main():
     app.add_handler(CommandHandler("urgent", urgent_cmd))
     app.add_handler(CommandHandler("cooldowns", cooldowns_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
-
     app.add_handler(whale_conv)
-    app.add_handler(add_note_conv)
-    app.add_handler(quick_cooldown_conv)
-
-    app.add_handler(CallbackQueryHandler(quick_status_callback, pattern=r"^quickstatus:"))
-    app.add_handler(CallbackQueryHandler(clear_cooldown_callback, pattern=r"^clearcooldown:"))
 
     logger.info("Whale bot starting...")
+    init_db()
     app.run_polling(drop_pending_updates=True)
 
 
