@@ -101,6 +101,9 @@ def init_db():
                 """
             )
 
+            cur.execute("ALTER TABLE whales ADD COLUMN IF NOT EXISTS priority TEXT;")
+            cur.execute("ALTER TABLE whales ADD COLUMN IF NOT EXISTS action_needed TEXT;")
+
             cur.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_whales_model_user
@@ -130,6 +133,9 @@ def init_db():
                 );
                 """
             )
+
+            cur.execute("ALTER TABLE whale_updates ADD COLUMN IF NOT EXISTS priority TEXT;")
+            cur.execute("ALTER TABLE whale_updates ADD COLUMN IF NOT EXISTS action_needed TEXT;")
     finally:
         conn.close()
 
@@ -238,7 +244,7 @@ def fetch_whales_for_model(model_name: str, only_urgent: bool = False, only_cool
             sql += """
                 ORDER BY
                     CASE
-                        WHEN current_status IN ('CRITICAL','AT RISK') THEN 1
+                        WHEN current_status IN ('Critical','At Risk') THEN 1
                         WHEN is_cooldown = TRUE THEN 2
                         ELSE 3
                     END,
@@ -375,7 +381,7 @@ async def send_to_registered_topic(bot, whale_row, extra_alert: bool = True):
         text=format_whale_update_message(whale_row),
     )
 
-    if extra_alert and whale_row["current_status"] in URGENT_STATUSES:
+    if extra_alert and whale_row["current_status"] in ("Critical", "At Risk"):
         alert_text = (
             "🚨 WHALE ALERT\n\n"
             f"Model: {str(whale_row['model_name']).upper()}\n"
@@ -737,14 +743,11 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # MAIN
 # =========================================================
-async def post_init(app):
-    init_db()
-    logger.info("Database initialized.")
-
-
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing")
+
+    init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -769,7 +772,6 @@ def main():
     app.add_handler(whale_conv)
 
     logger.info("Whale bot starting...")
-    init_db()
     app.run_polling(drop_pending_updates=True)
 
 
