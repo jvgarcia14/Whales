@@ -647,9 +647,7 @@ async def whale_model_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = ", ".join(sorted(models.keys())[:20])
         extra = " ..." if len(models) > 20 else ""
         await update.message.reply_text(
-            "Model not found. Type the model name exactly as registered.
-
-"
+            "Model not found. Type the model name exactly as registered."
             f"Available models: {preview}{extra}"
         )
         return WHALE_SELECT_MODEL
