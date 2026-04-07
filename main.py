@@ -68,7 +68,6 @@ URGENT_STATUSES = {"MAD", "UPSET", "WANNA LEAVE"}
 # =========================================================
 # DB
 # =========================================================
-
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is missing")
@@ -147,7 +146,6 @@ def init_db():
 # =========================================================
 # HELPERS
 # =========================================================
-
 def user_is_admin(user_id: int) -> bool:
     if not ADMIN_IDS:
         return True
@@ -632,8 +630,8 @@ async def whale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = ", ".join(m.title() for m in models[:20])
     extra = " ..." if len(models) > 20 else ""
     await update.message.reply_text(
-        "Type the model name exactly as registered."
-        f"Registered models: {preview}{extra}"
+        "Type the model name exactly as registered.\n\n"
+        f"Registered models: {preview}{extra}\n\n"
         "Example: carter"
     )
     return WHALE_SELECT_MODEL
@@ -647,15 +645,16 @@ async def whale_model_typed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = ", ".join(sorted(models.keys())[:20])
         extra = " ..." if len(models) > 20 else ""
         await update.message.reply_text(
-            "Model not found. Type the model name exactly as registered."
+            "Model not found. Type the model name exactly as registered.\n\n"
             f"Available models: {preview}{extra}"
         )
         return WHALE_SELECT_MODEL
 
     context.user_data.setdefault("whale_form", {})["model_name"] = typed_model
-    await update.message.reply_text(f"Selected model: {typed_model.title()}
-
-Send whale name:")
+    await update.message.reply_text(
+        f"Selected model: {typed_model.title()}\n\n"
+        "Send whale name:"
+    )
     return WHALE_NAME
 
 
@@ -675,19 +674,28 @@ async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = [f"🐳 ACTIVE WHALES — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        text.append(
-            f"{i}. {r['whale_name']}\n"
-            f"🆔 {r['whale_user_id']}\n"
-            f"📌 {r['current_status']}{' ❄️' if r['is_cooldown'] else ''}\n"
-            f"💬 {r.get('last_convo') or '-'}\n"
-            f"📝 {r.get('notes') or '-'}\n"
-            f"⏳ {r.get('cooldown_reason') or '-'}\n" if r['is_cooldown'] else
-            f"{i}. {r['whale_name']}\n🆔 {r['whale_user_id']}\n📌 {r['current_status']}\n💬 {r.get('last_convo') or '-'}\n📝 {r.get('notes') or '-'}\n"
-        )
-        text.append(
+        if r["is_cooldown"]:
+            entry = (
+                f"{i}. {r['whale_name']}\n"
+                f"🆔 {r['whale_user_id']}\n"
+                f"📌 {r['current_status']} ❄️\n"
+                f"💬 {r.get('last_convo') or '-'}\n"
+                f"📝 {r.get('notes') or '-'}\n"
+                f"⏳ {r.get('cooldown_reason') or '-'}\n"
+            )
+        else:
+            entry = (
+                f"{i}. {r['whale_name']}\n"
+                f"🆔 {r['whale_user_id']}\n"
+                f"📌 {r['current_status']}\n"
+                f"💬 {r.get('last_convo') or '-'}\n"
+                f"📝 {r.get('notes') or '-'}\n"
+            )
+        entry += (
             f"👨 {r.get('last_updated_by_username') or '-'}\n"
             f"🕒 {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
+        text.append(entry)
 
     final_text = "\n".join(text)
     for chunk in split_text(final_text):
@@ -710,18 +718,26 @@ async def handover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📋 WHALE HANDOVER — {model_name.upper()}\n"]
     for i, r in enumerate(rows, start=1):
-        lines.append(
-            f"{i}. {r['whale_name']} — {r['current_status']}{' ❄️' if r['is_cooldown'] else ''}\n"
-            f"- user id: {r['whale_user_id']}\n"
-            f"- last convo: {r.get('last_convo') or '-'}\n"
-            f"- notes: {r.get('notes') or '-'}\n"
-            f"- cooldown: {r.get('cooldown_reason') or '-'}\n" if r['is_cooldown'] else
-            f"{i}. {r['whale_name']} — {r['current_status']}\n- user id: {r['whale_user_id']}\n- last convo: {r.get('last_convo') or '-'}\n- notes: {r.get('notes') or '-'}\n"
-        )
-        lines.append(
+        if r["is_cooldown"]:
+            entry = (
+                f"{i}. {r['whale_name']} — {r['current_status']} ❄️\n"
+                f"- user id: {r['whale_user_id']}\n"
+                f"- last convo: {r.get('last_convo') or '-'}\n"
+                f"- notes: {r.get('notes') or '-'}\n"
+                f"- cooldown: {r.get('cooldown_reason') or '-'}\n"
+            )
+        else:
+            entry = (
+                f"{i}. {r['whale_name']} — {r['current_status']}\n"
+                f"- user id: {r['whale_user_id']}\n"
+                f"- last convo: {r.get('last_convo') or '-'}\n"
+                f"- notes: {r.get('notes') or '-'}\n"
+            )
+        entry += (
             f"- updated by: {r.get('last_updated_by_username') or '-'}\n"
             f"- updated at: {fmt_dt_pst(r.get('last_updated_at'))}\n"
         )
+        lines.append(entry)
 
     final_text = "\n".join(lines)
     for chunk in split_text(final_text):
