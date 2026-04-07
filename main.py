@@ -632,12 +632,8 @@ async def whale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview = ", ".join(m.title() for m in models[:20])
     extra = " ..." if len(models) > 20 else ""
     await update.message.reply_text(
-        "Type the model name exactly as registered.
-
-"
-        f"Registered models: {preview}{extra}
-
-"
+        "Type the model name exactly as registered."
+        f"Registered models: {preview}{extra}"
         "Example: carter"
     )
     return WHALE_SELECT_MODEL
